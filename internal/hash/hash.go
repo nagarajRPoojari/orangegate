@@ -42,8 +42,9 @@ func (h *HashRing) Add(addr string, port int64) {
 	}
 	hash := int(hashKey(addr))
 	h.allNodes[hash] = cl
-	log.Infof("Adding %v, %d", addr, port)
 	sort.Ints(h.keys)
+
+	log.Infof("Adding %v, %d", addr, port)
 }
 
 // Remove deletes a node and its replicas from the ring
