@@ -3,7 +3,6 @@ module github.com/nagarajRPoojari/orangegate
 go 1.24.5
 
 require (
-	github.com/fsnotify/fsnotify v1.9.0
 	github.com/nagarajRPoojari/orange v0.0.0-20250801162142-07c525a73b44
 	k8s.io/api v0.33.3
 )

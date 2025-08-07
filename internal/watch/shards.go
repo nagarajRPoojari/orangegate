@@ -93,9 +93,11 @@ func (t *Watcher) Run(hashRing *hash.HashRing) {
 		switch event.Type {
 		case watch.Added:
 			log.Infof("[ADDED] Pod %s - Phase: %s\n", pod.Name, pod.Status.Phase)
-			hashRing.Add(pod.Status.PodIP, 52001)
 		case watch.Modified:
 			log.Infof("[MODIFIED] Pod %s - Phase: %s\n", pod.Name, pod.Status.Phase)
+			if pod.Status.Phase == "Running" {
+				hashRing.Add(pod.Status.PodIP, 52001)
+			}
 		case watch.Deleted:
 			log.Infof("[DELETED] Pod %s\n", pod.Name)
 			hashRing.Remove(pod.Status.PodIP)

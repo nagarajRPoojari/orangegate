@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"sync"
 
 	"github.com/nagarajRPoojari/orangegate/internal/hash"
@@ -30,27 +29,17 @@ type Req struct {
 }
 
 func NewProxy(addr string) *Proxy {
-	t := &Proxy{Addr: addr, wt: *watch.NewWatcher()}
+	t := &Proxy{Addr: addr, wt: *watch.NewWatcher(), hashRing: hash.NewHashRing(3)}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		defer mu.RUnlock()
-
-		if len(targets) == 0 {
-			http.Error(w, "No targets available", http.StatusServiceUnavailable)
-			return
-		}
-
-		target := targets[0]
-		fullURL := t.mustParse(target)
-
-		log.Infof(fullURL.String())
 
 		var req Req
 
 		err := json.NewDecoder(r.Body).Decode(&req)
 
 		res, err := t.processQuery(req.Query)
-
+		log.Infof("recevied result, res=%v, err=%v, query: %v", res, err, req.Query)
 		if err != nil {
 			http.Error(w, "Proxy error: "+err.Error(), 502)
 			return
@@ -58,6 +47,7 @@ func NewProxy(addr string) *Proxy {
 
 		if res == nil {
 			res = "sucess"
+			return
 		}
 
 		var data interface{}
@@ -88,14 +78,6 @@ func (t *Proxy) WatchShards() {
 	go t.wt.Run(t.hashRing)
 }
 
-func (t *Proxy) mustParse(s string) *url.URL {
-	u, err := url.Parse(s)
-	if err != nil {
-		log.Warnf("Invalid URL:", s)
-	}
-	return u
-}
-
 func (t *Proxy) processQuery(q string) (any, error) {
 	parser := query.NewParser(q)
 	op, err := parser.Build()
@@ -110,7 +92,24 @@ func (t *Proxy) processQuery(q string) (any, error) {
 		}
 		return nil, nil
 	case query.InsertOp:
-		key := v.Value["_ID"].(int64)
+		var key int64
+		switch val := v.Value["_ID"].(type) {
+		case int64:
+			key = val
+		case int:
+			key = int64(val)
+		case float64:
+			key = int64(val)
+		case json.Number:
+			k, err := val.Int64()
+			if err == nil {
+				key = k
+			} else {
+				log.Fatalf("can't cast json val, %v", val)
+			}
+		default:
+			log.Fatalf("can't cast, %v", val)
+		}
 		cl := t.hashRing.Get(fmt.Sprint(key))
 		return nil, cl.Insert(&v)
 	case query.SelectOp:

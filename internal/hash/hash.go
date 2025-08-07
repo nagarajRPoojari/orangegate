@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/nagarajRPoojari/orange/net/client"
+	log "github.com/nagarajRPoojari/orangegate/internal/utils/logger"
 )
 
 // HashRing is the structure for consistent hashing
@@ -26,6 +27,8 @@ func NewHashRing(replicas int) *HashRing {
 	return &HashRing{
 		replicas: replicas,
 		hashMap:  make(map[int]*client.Client),
+		allNodes: map[int]*client.Client{},
+		keys:     make([]int, 0),
 	}
 }
 
@@ -39,6 +42,7 @@ func (h *HashRing) Add(addr string, port int64) {
 	}
 	hash := int(hashKey(addr))
 	h.allNodes[hash] = cl
+	log.Infof("Adding %v, %d", addr, port)
 	sort.Ints(h.keys)
 }
 
@@ -72,6 +76,7 @@ func (h *HashRing) Get(key string) *client.Client {
 	if idx == len(h.keys) {
 		idx = 0
 	}
+	log.Infof("key , %v", h.keys[idx])
 	return h.hashMap[h.keys[idx]]
 }
 
