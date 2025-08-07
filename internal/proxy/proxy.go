@@ -6,10 +6,10 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/nagarajRPoojari/orange/pkg/oql"
 	"github.com/nagarajRPoojari/orangegate/internal/hash"
 	log "github.com/nagarajRPoojari/orangegate/internal/utils/logger"
 
-	"github.com/nagarajRPoojari/orange/pkg/query"
 	"github.com/nagarajRPoojari/orangegate/internal/watch"
 )
 
@@ -79,19 +79,19 @@ func (t *Proxy) WatchShards() {
 }
 
 func (t *Proxy) processQuery(q string) (any, error) {
-	parser := query.NewParser(q)
+	parser := oql.NewParser(q)
 	op, err := parser.Build()
 	if err != nil {
 		return nil, err
 	}
 
 	switch v := op.(type) {
-	case query.CreateOp:
+	case oql.CreateOp:
 		for _, cl := range t.hashRing.GetAll() {
 			cl.Create(&v)
 		}
 		return nil, nil
-	case query.InsertOp:
+	case oql.InsertOp:
 		var key int64
 		switch val := v.Value["_ID"].(type) {
 		case int64:
@@ -112,11 +112,11 @@ func (t *Proxy) processQuery(q string) (any, error) {
 		}
 		cl := t.hashRing.Get(fmt.Sprint(key))
 		return nil, cl.Insert(&v)
-	case query.SelectOp:
+	case oql.SelectOp:
 		key := v.ID
 		cl := t.hashRing.Get(fmt.Sprint(key))
 		return cl.Select(&v)
-	case query.DeleteOp:
+	case oql.DeleteOp:
 		return nil, fmt.Errorf("delete op not implpemented")
 	}
 
