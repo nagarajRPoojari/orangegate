@@ -23,13 +23,27 @@ var (
 	mu      sync.RWMutex
 )
 
+// Proxy represents a network proxy that routes requests to backend replicas
+// using consistent hashing via an OuterRing. It also manages client connections
+// through a Cache and watches for changes using a Watcher.
 type Proxy struct {
-	Addr     string
-	wt       watch.Watcher
+	// Addr is the network address of this proxy instance.
+	Addr string
+
+	// wt watches for updates or changes in the cluster (e.g., shards or replicas).
+	wt watch.Watcher
+
+	// hashRing is the consistent hashing ring used to route keys to shards.
 	hashRing *hash.OuterRing
 
-	cache        *Cache
-	namespace    string
+	// cache stores and reuses client connections to backend replicas.
+	cache *Cache
+
+	// k8s namespace within which pods are deployed, used to dynamically build
+	// dns address of pods
+	namespace string
+
+	// replicaCount defines the number of replicas per shard managed by this proxy.
 	replicaCount int
 }
 
@@ -97,10 +111,17 @@ func (t *Proxy) WatchShards() {
 	go t.wt.Run(t.hashRing)
 }
 
-func buildAddr(shard string, podId int, namespcae string) string {
-	return fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", shard, podId, shard, namespcae)
+// buildAddr constructs the full DNS address for a pod within a shard in the given namespace.
+// The format follows Kubernetes DNS conventions for service discovery.
+func buildAddr(shard string, podId int, namespace string) string {
+	return fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", shard, podId, shard, namespace)
 }
 
+// processQuery parses and executes an OQL query string by dispatching it to the appropriate
+// operation handler. It supports Create, Insert, Select, and Delete operations, routing
+// requests to the correct shards and replicas via the consistent hashing ring and cached clients.
+//
+// Returns the operation result or an error if the query is invalid or the operation fails.
 func (t *Proxy) processQuery(q string) (any, error) {
 	parser := oql.NewParser(q)
 	op, err := parser.Build()
@@ -110,6 +131,7 @@ func (t *Proxy) processQuery(q string) (any, error) {
 
 	switch v := op.(type) {
 	case oql.CreateOp:
+		// create requests are broadcasted to all nodes of all shards
 		shs := t.hashRing.GetAllShards()
 		for _, sh := range shs {
 			for i := range t.replicaCount {

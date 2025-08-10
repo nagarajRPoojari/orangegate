@@ -33,11 +33,21 @@ func NewWatcher() *Watcher {
 	return &Watcher{}
 }
 
+// Run starts the watcher that monitors Kubernetes StatefulSets with a specific label selector
+// in the configured namespace. It initializes the Kubernetes client configuration, lists the
+// existing StatefulSets to populate the consistent hash ring, and then watches for add, modify,
+// and delete events to update the hash ring dynamically.
+//
+// The hashRing parameter is updated in response to StatefulSet lifecycle events, adding or removing
+// shards as StatefulSets become fully ready or are deleted.
+//
+// This function blocks while watching events and logs relevant state changes.
 func (t *Watcher) Run(hashRing *hash.OuterRing) {
 	// Use in-cluster config
 	mode := utils.GetEnv(__BUILD_MODE__, __DEV__)
 	var config *rest.Config
 	var err error
+	// build the config from local k8s config file when running outside k8s (in DEV mode)
 	if mode == __DEV__ {
 		config, err = clientcmd.BuildConfigFromFlags("", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
 		if err != nil {
@@ -65,6 +75,7 @@ func (t *Watcher) Run(hashRing *hash.OuterRing) {
 		log.Fatalf("Error listing StatefulSets: %v", err)
 	}
 
+	// pre-populating hash ring with existing statefulsets
 	for _, ss := range ssList.Items {
 		desired := int32(0)
 		if ss.Spec.Replicas != nil {
@@ -73,7 +84,10 @@ func (t *Watcher) Run(hashRing *hash.OuterRing) {
 		}
 
 		ready := ss.Status.ReadyReplicas
-
+		// adding only fully up statefulsets with all replicas
+		// half up (one with fewer ready replicas) will eventually result
+		// in `modified` event
+		// @address: not sure will it result in modified event or not
 		if ready == desired {
 			log.Infof("StatefulSet '%s' is fully ready (%d/%d replicas)\n", ss.Name, ready, desired)
 			hashRing.Add(ss.Name)
@@ -112,6 +126,13 @@ func (t *Watcher) Run(hashRing *hash.OuterRing) {
 			log.Infof("[MODIFIED] StatefulSet: %s | ReadyReplicas: %d/%d\n",
 				ss.Name, ss.Status.ReadyReplicas, *ss.Spec.Replicas)
 
+			// statefulsets are only added when it is up with all replicas but
+			// we are also not removing as soon one or more pod crashes since it
+			// will eventually spinned up by StatefulSet reconciler itself.
+			// @issue: by that time write requests to that node will fail
+			//		  resulting in a temperory down for few set of keys
+			//		  if we are using quorum reads it shouldn't affecy unless majority of the
+			//		  pods are down simultaniously
 			if ss.Status.ReadyReplicas == *ss.Spec.Replicas {
 				log.Infof("All replicas are ready for StatefulSet: %s\n", ss.Name)
 				hashRing.Add(ss.Name)
