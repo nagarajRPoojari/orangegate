@@ -2,90 +2,196 @@ package hash
 
 import (
 	"crypto/sha1"
-	"sort"
-	"strconv"
-
-	"github.com/nagarajRPoojari/orange/net/client"
-	log "github.com/nagarajRPoojari/orangegate/internal/utils/logger"
+	"fmt"
 )
 
-// HashRing is the structure for consistent hashing
-type HashRing struct {
-	// number of virtual nodes per shard-replica
-	replicas int
-	// list of hash values of all nodes (including virtual) for easy binary search
-	keys []int
-	// map of real node hash with its grpc client for broadcast
-	allNodes map[int]*client.Client
-
-	// hashring with all nodes
-	hashMap map[int]*client.Client
+type InnerRingNode struct {
+	Next *InnerRingNode
+	Addr string
+	Hash uint32
 }
 
-// NewHashRing initializes a HashRing
-func NewHashRing(replicas int) *HashRing {
-	return &HashRing{
-		replicas: replicas,
-		hashMap:  make(map[int]*client.Client),
-		allNodes: map[int]*client.Client{},
-		keys:     make([]int, 0),
+type InnerRing struct {
+	Head *InnerRingNode
+}
+
+type Shard struct {
+	Id   string
+	Ring InnerRing
+}
+
+type OuterRingNode struct {
+	Next *OuterRingNode
+	Val  *Shard
+	Hash uint32
+}
+
+type OuterRing struct {
+	VirtualShards   int
+	Head            *OuterRingNode
+	ReplicaPerShard int
+	Namespace       string
+
+	allShards map[string]*Shard
+}
+
+func NewHashRing(virtualShards, replicaPerShard int, namespace string) *OuterRing {
+	return &OuterRing{VirtualShards: virtualShards, ReplicaPerShard: replicaPerShard, Namespace: namespace, allShards: make(map[string]*Shard)}
+}
+
+func (t *OuterRing) Add(shard string) {
+	var sh *Shard
+	for i := 0; i < t.VirtualShards; i++ {
+		sh = t.add(shard, i)
+	}
+	t.allShards[shard] = sh
+}
+
+func (t *OuterRing) GetAllShards() map[string]*Shard {
+	return t.allShards
+}
+
+func (t *OuterRing) add(shard string, id int) *Shard {
+	iHead := &InnerRingNode{Addr: fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", shard, 0, shard, t.Namespace), Hash: hashKey("pod-0")}
+	innerRing := InnerRing{Head: iHead}
+	for i := 1; i < t.ReplicaPerShard; i++ {
+		iHead.Next = &InnerRingNode{
+			Addr: fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", shard, i, shard, t.Namespace),
+			Hash: hashKey(fmt.Sprintf("pod-%d", i)),
+		}
+		iHead = iHead.Next
+	}
+
+	node := &OuterRingNode{
+		Val:  &Shard{Id: shard, Ring: innerRing},
+		Hash: hashKey(fmt.Sprintf("%s-%d", shard, id)),
+	}
+
+	if t.Head == nil {
+		t.Head = node
+		return node.Val
+	}
+	if node.Hash < t.Head.Hash {
+		node.Next = t.Head
+		t.Head = node
+		return node.Val
+	}
+
+	first, second := t.Head, t.Head.Next
+	for {
+		if second == nil || second.Hash > node.Hash {
+			first.Next = node
+			node.Next = second
+			return node.Val
+		}
+		first = second
+		second = second.Next
 	}
 }
 
-// Add adds a node to the hash ring
-func (h *HashRing) Add(addr string, port int64) {
-	cl := client.NewClient(addr, port)
-	for i := 0; i < h.replicas; i++ {
-		hash := int(hashKey(addr + strconv.Itoa(i)))
-		h.keys = append(h.keys, hash)
-		h.hashMap[hash] = cl
+func (t *OuterRing) GetNode(key string) string {
+	if t.Head == nil {
+		return ""
 	}
-	hash := int(hashKey(addr))
-	h.allNodes[hash] = cl
-	sort.Ints(h.keys)
 
-	log.Infof("Adding %v, %d", addr, port)
-}
+	keyHash := hashKey(key)
 
-// Remove deletes a node and its replicas from the ring
-func (h *HashRing) Remove(node string) {
-	for i := 0; i < h.replicas; i++ {
-		replicaHash := int(hashKey(node + strconv.Itoa(i)))
-		shardHash := int(hashKey(node))
-		delete(h.hashMap, replicaHash)
-		delete(h.allNodes, shardHash)
-		// Remove from keys slice
-		for j, k := range h.keys {
-			if k == replicaHash {
-				h.keys = append(h.keys[:j], h.keys[j+1:]...)
+	// 1. Find the shard (OuterRingNode) responsible for this key
+	curr := t.Head
+	var selected *OuterRingNode
+
+	// Check if ring is circular
+	if curr.Next == nil {
+		selected = curr
+	} else {
+		for {
+			if keyHash <= curr.Hash {
+				selected = curr
 				break
 			}
+			if curr.Next == nil {
+				selected = t.Head
+				break
+			}
+			curr = curr.Next
+		}
+	}
+
+	// 2. Within selected shard, find the appropriate replica (InnerRingNode)
+	if selected == nil || selected.Val == nil || selected.Val.Ring.Head == nil {
+		return ""
+	}
+
+	innerHead := selected.Val.Ring.Head
+	inner := innerHead
+	for {
+		if keyHash <= inner.Hash {
+			return inner.Addr
+		}
+		inner = inner.Next
+		if inner == nil {
+			return innerHead.Addr
 		}
 	}
 }
 
-// Get returns the closest node in the hash ring for the given key
-func (h *HashRing) Get(key string) *client.Client {
-	if len(h.keys) == 0 {
+func (t *OuterRing) GetShard(key string) *Shard {
+	if t.Head == nil {
 		return nil
 	}
-	hash := int(hashKey(key))
-	// Binary search for appropriate replica
-	idx := sort.Search(len(h.keys), func(i int) bool {
-		return h.keys[i] >= hash
-	})
-	if idx == len(h.keys) {
-		idx = 0
+
+	keyHash := hashKey(key)
+
+	// 1. Find the shard (OuterRingNode) responsible for this key
+	curr := t.Head
+	var selected *OuterRingNode
+
+	// Check if ring is circular
+	if curr.Next == nil {
+		selected = curr
+	} else {
+		for {
+			if keyHash <= curr.Hash {
+				selected = curr
+				break
+			}
+			if curr.Next == nil {
+				selected = t.Head
+				break
+			}
+			curr = curr.Next
+		}
 	}
-	log.Infof("key , %v", h.keys[idx])
-	return h.hashMap[h.keys[idx]]
+	return selected.Val
 }
 
-func (h *HashRing) GetAll() map[int]*client.Client {
-	return h.allNodes
+func (t *OuterRing) Remove(shard string) {
+	for i := 0; i < t.VirtualShards; i++ {
+		t.remove(shard, i)
+	}
 }
 
-// hashKey generates a consistent SHA-1 hash
+func (t *OuterRing) remove(shard string, id int) {
+	if t.Head == nil {
+		return
+	}
+	keyHash := hashKey(fmt.Sprintf("%s-%d", shard, id))
+	if t.Head.Hash == keyHash {
+		t.Head = t.Head.Next
+		return
+	}
+
+	prev := t.Head
+	for curr := t.Head.Next; curr != nil; {
+		if curr.Hash == keyHash {
+			prev.Next = curr.Next
+			return
+		}
+		prev = curr
+		curr = curr.Next
+	}
+}
+
 func hashKey(key string) uint32 {
 	h := sha1.New()
 	h.Write([]byte(key))

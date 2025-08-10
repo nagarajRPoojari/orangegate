@@ -6,11 +6,10 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/nagarajRPoojari/orangegate/internal/hash"
-	"github.com/nagarajRPoojari/orangegate/internal/utils"
-	log "github.com/nagarajRPoojari/orangegate/internal/utils/logger"
-
-	v1 "k8s.io/api/core/v1"
+	"github.com/nagarajRPoojari/orangectl/internal/hash"
+	"github.com/nagarajRPoojari/orangectl/internal/utils"
+	log "github.com/nagarajRPoojari/orangectl/internal/utils/logger"
+	appsv1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
@@ -19,9 +18,9 @@ import (
 )
 
 const (
-	__K8S_NAMESAPCE__    = "__K8S_NAMESAPCE__"
-	__K8S_POD_SELECTOR__ = "__K8S_POD_SELECTOR__"
-	__BUILD_MODE__       = "__BUILD_MODE__"
+	__K8S_NAMESAPCE__      = "__K8S_NAMESAPCE__"
+	__K8S_SHARD_SELECTOR__ = "__K8S_SHARD_SELECTOR__"
+	__BUILD_MODE__         = "__BUILD_MODE__"
 
 	__DEV__  = "dev"
 	__PROD__ = "prod"
@@ -34,7 +33,7 @@ func NewWatcher() *Watcher {
 	return &Watcher{}
 }
 
-func (t *Watcher) Run(hashRing *hash.HashRing) {
+func (t *Watcher) Run(hashRing *hash.OuterRing) {
 	// Use in-cluster config
 	mode := utils.GetEnv(__BUILD_MODE__, __DEV__)
 	var config *rest.Config
@@ -56,53 +55,76 @@ func (t *Watcher) Run(hashRing *hash.HashRing) {
 	}
 
 	namespace := utils.GetEnv(__K8S_NAMESAPCE__, "", true)
-	labelVal := utils.GetEnv(__K8S_POD_SELECTOR__, "", true)
-	labelSelector := fmt.Sprintf("pod-selector=%s", labelVal)
+	labelVal := utils.GetEnv(__K8S_SHARD_SELECTOR__, "", true)
+	labelSelector := fmt.Sprintf("shard-selector=%s", labelVal)
 
-	podList, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+	ssList, err := clientset.AppsV1().StatefulSets(namespace).List(context.Background(), metav1.ListOptions{
 		LabelSelector: labelSelector,
 	})
 	if err != nil {
-		log.Fatalf("Error listing pods: %v", err)
+		log.Fatalf("Error listing StatefulSets: %v", err)
 	}
 
-	for _, pod := range podList.Items {
-		if pod.Status.Phase == v1.PodRunning {
-			log.Infof("[EXISTING] Pod %s is already running with IP %s", pod.Name, pod.Status.PodIP)
-			hashRing.Add(pod.Status.PodIP, 52001)
+	for _, ss := range ssList.Items {
+		desired := int32(0)
+		if ss.Spec.Replicas != nil {
+			desired = *ss.Spec.Replicas
+			log.Infof("setting desired replicas to %d", desired)
+		}
+
+		ready := ss.Status.ReadyReplicas
+
+		if ready == desired {
+			log.Infof("StatefulSet '%s' is fully ready (%d/%d replicas)\n", ss.Name, ready, desired)
+			hashRing.Add(ss.Name)
+		} else {
+			log.Infof("StatefulSet '%s' is not ready (%d/%d replicas)\n", ss.Name, ready, desired)
+			hashRing.Add(ss.Name)
 		}
 	}
 
-	watcher, err := clientset.CoreV1().Pods(namespace).Watch(context.TODO(), metav1.ListOptions{
+	watcher, err := clientset.AppsV1().StatefulSets(namespace).Watch(context.TODO(), metav1.ListOptions{
 		LabelSelector: labelSelector,
 	})
 	if err != nil {
-		log.Fatalf("Failed to start pod watcher: %v", err)
+		log.Fatalf("Failed to start statefulset watcher: %v", err)
 	}
 	defer watcher.Stop()
 
-	log.Infof("Watching pods in namespace '%s' with label selector '%s'\n", namespace, labelSelector)
+	log.Infof("Watching statefulsets in namespace '%s' with label selector '%s'\n", namespace, labelSelector)
 
-	for event := range watcher.ResultChan() {
-		pod, ok := event.Object.(*v1.Pod)
+	ch := watcher.ResultChan()
+	for event := range ch {
+		ss, ok := event.Object.(*appsv1.StatefulSet)
 		if !ok {
-			log.Warnf("Unexpected type")
+			fmt.Println("unexpected type")
 			continue
 		}
 
 		switch event.Type {
 		case watch.Added:
-			log.Infof("[ADDED] Pod %s - Phase: %s\n", pod.Name, pod.Status.Phase)
-		case watch.Modified:
-			log.Infof("[MODIFIED] Pod %s - Phase: %s\n", pod.Name, pod.Status.Phase)
-			if pod.Status.Phase == "Running" {
-				hashRing.Add(pod.Status.PodIP, 52001)
+			log.Infof("[ADDED] StatefulSet: %s\n", ss.Name)
+			if ss.Status.ReadyReplicas == *ss.Spec.Replicas {
+				log.Infof("All replicas are ready for StatefulSet: %s\n", ss.Name)
+				hashRing.Add(ss.Name)
 			}
+		case watch.Modified:
+			log.Infof("[MODIFIED] StatefulSet: %s | ReadyReplicas: %d/%d\n",
+				ss.Name, ss.Status.ReadyReplicas, *ss.Spec.Replicas)
+
+			if ss.Status.ReadyReplicas == *ss.Spec.Replicas {
+				log.Infof("All replicas are ready for StatefulSet: %s\n", ss.Name)
+				hashRing.Add(ss.Name)
+			}
+
 		case watch.Deleted:
-			log.Infof("[DELETED] Pod %s\n", pod.Name)
-			hashRing.Remove(pod.Status.PodIP)
-		default:
-			log.Infof("[OTHER] Pod %s - Event: %s\n", pod.Name, event.Type)
+			log.Infof("[DELETED] StatefulSet: %s\n", ss.Name)
+			hashRing.Remove(ss.Name)
+
+		case watch.Error:
+			log.Infof("[ERROR] Watch error\n")
 		}
 	}
+
+	fmt.Println("Watch channel closed")
 }

@@ -7,10 +7,15 @@ import (
 	"sync"
 
 	"github.com/nagarajRPoojari/orange/pkg/oql"
-	"github.com/nagarajRPoojari/orangegate/internal/hash"
-	log "github.com/nagarajRPoojari/orangegate/internal/utils/logger"
+	"github.com/nagarajRPoojari/orangectl/internal/hash"
+	"github.com/nagarajRPoojari/orangectl/internal/utils"
+	log "github.com/nagarajRPoojari/orangectl/internal/utils/logger"
+	"github.com/nagarajRPoojari/orangectl/internal/watch"
+)
 
-	"github.com/nagarajRPoojari/orangegate/internal/watch"
+const (
+	__K8S__REPLICA_COUNT__ = "__K8S__REPLICA_COUNT__"
+	__K8S_NAMESAPCE__      = "__K8S_NAMESAPCE__"
 )
 
 var (
@@ -21,7 +26,11 @@ var (
 type Proxy struct {
 	Addr     string
 	wt       watch.Watcher
-	hashRing *hash.HashRing
+	hashRing *hash.OuterRing
+
+	cache        *Cache
+	namespace    string
+	replicaCount int
 }
 
 type Req struct {
@@ -29,7 +38,17 @@ type Req struct {
 }
 
 func NewProxy(addr string) *Proxy {
-	t := &Proxy{Addr: addr, wt: *watch.NewWatcher(), hashRing: hash.NewHashRing(3)}
+	replicaCount := utils.GetEnv(__K8S__REPLICA_COUNT__, 0, true)
+	namespcae := utils.GetEnv(__K8S_NAMESAPCE__, "", true)
+
+	t := &Proxy{
+		Addr:         addr,
+		wt:           *watch.NewWatcher(),
+		hashRing:     hash.NewHashRing(3, replicaCount, namespcae),
+		namespace:    namespcae,
+		replicaCount: replicaCount,
+		cache:        NewCache(),
+	}
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		mu.RLock()
 		defer mu.RUnlock()
@@ -78,6 +97,10 @@ func (t *Proxy) WatchShards() {
 	go t.wt.Run(t.hashRing)
 }
 
+func buildAddr(shard string, podId int, namespcae string) string {
+	return fmt.Sprintf("%s-%d.%s.%s.svc.cluster.local", shard, podId, shard, namespcae)
+}
+
 func (t *Proxy) processQuery(q string) (any, error) {
 	parser := oql.NewParser(q)
 	op, err := parser.Build()
@@ -87,10 +110,16 @@ func (t *Proxy) processQuery(q string) (any, error) {
 
 	switch v := op.(type) {
 	case oql.CreateOp:
-		for _, cl := range t.hashRing.GetAll() {
-			cl.Create(&v)
+		shs := t.hashRing.GetAllShards()
+		for _, sh := range shs {
+			for i := range t.replicaCount {
+				cl := t.cache.Get(buildAddr(sh.Id, i, t.namespace))
+				log.Infof("calling create to: ", buildAddr(sh.Id, i, t.namespace))
+				cl.Create(&v)
+			}
 		}
 		return nil, nil
+
 	case oql.InsertOp:
 		var key int64
 		switch val := v.Value["_ID"].(type) {
@@ -110,12 +139,24 @@ func (t *Proxy) processQuery(q string) (any, error) {
 		default:
 			log.Fatalf("can't cast, %v", val)
 		}
-		cl := t.hashRing.Get(fmt.Sprint(key))
+		addr := t.hashRing.GetNode(fmt.Sprint(key))
+		log.Infof("calling insert to: %s", addr)
+		cl := t.cache.Get(addr)
 		return nil, cl.Insert(&v)
+
 	case oql.SelectOp:
 		key := v.ID
-		cl := t.hashRing.Get(fmt.Sprint(key))
-		return cl.Select(&v)
+		sh := t.hashRing.GetShard(fmt.Sprint(key))
+		var res []byte
+		var err error
+		for i := range t.replicaCount {
+			cl := t.cache.Get(buildAddr(sh.Id, i, t.namespace))
+			// offcourse this is not how quorum works
+			res, err = cl.Select(&v)
+			fmt.Println(res)
+		}
+		return res, err
+
 	case oql.DeleteOp:
 		return nil, fmt.Errorf("delete op not implpemented")
 	}
