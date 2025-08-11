@@ -75,25 +75,29 @@ func (t *Watcher) Run(hashRing *hash.OuterRing) {
 		log.Fatalf("Error listing StatefulSets: %v", err)
 	}
 
-	// pre-populating hash ring with existing statefulsets
+	// Pre-populate the hash ring with existing StatefulSets.
 	for _, ss := range ssList.Items {
 		desired := int32(0)
 		if ss.Spec.Replicas != nil {
 			desired = *ss.Spec.Replicas
-			log.Infof("setting desired replicas to %d", desired)
+			log.Infof("Setting desired replicas for StatefulSet '%s' to %d", ss.Name, desired)
 		}
 
 		ready := ss.Status.ReadyReplicas
-		// adding only fully up statefulsets with all replicas
-		// half up (one with fewer ready replicas) will eventually result
-		// in `modified` event
-		// @address: not sure will it result in modified event or not
+
+		// Only add fully ready StatefulSets (all replicas are ready) to the hash ring.
+		// If a StatefulSet is partially ready, we rely on a future `Modified` event
+		// to re-evaluate and add it to the hash ring once it becomes fully available.
+		//
+		// NOTE: In some cases, if the controller doesn’t emit a `Modified` event
+		// for partially-ready StatefulSets reaching readiness, we may need a periodic
+		// sync to ensure they eventually get added.
 		if ready == desired {
 			log.Infof("StatefulSet '%s' is fully ready (%d/%d replicas)\n", ss.Name, ready, desired)
 			hashRing.Add(ss.Name)
 		} else {
-			log.Infof("StatefulSet '%s' is not ready (%d/%d replicas)\n", ss.Name, ready, desired)
-			hashRing.Add(ss.Name)
+			log.Infof("StatefulSet '%s' is not fully ready (%d/%d replicas)\n", ss.Name, ready, desired)
+			// skip adding statefulsets as partial readiness is not acceptable.
 		}
 	}
 
@@ -118,21 +122,28 @@ func (t *Watcher) Run(hashRing *hash.OuterRing) {
 		switch event.Type {
 		case watch.Added:
 			log.Infof("[ADDED] StatefulSet: %s\n", ss.Name)
+
+			// Once a StatefulSet becomes fully ready (all replicas available),
+			// it may not trigger additional Modified events.
+			// Ensure it's added to the hash ring as soon as it's fully ready.
 			if ss.Status.ReadyReplicas == *ss.Spec.Replicas {
 				log.Infof("All replicas are ready for StatefulSet: %s\n", ss.Name)
 				hashRing.Add(ss.Name)
 			}
+
 		case watch.Modified:
 			log.Infof("[MODIFIED] StatefulSet: %s | ReadyReplicas: %d/%d\n",
 				ss.Name, ss.Status.ReadyReplicas, *ss.Spec.Replicas)
 
-			// statefulsets are only added when it is up with all replicas but
-			// we are also not removing as soon one or more pod crashes since it
-			// will eventually spinned up by StatefulSet reconciler itself.
-			// @issue: by that time write requests to that node will fail
-			//		  resulting in a temperory down for few set of keys
-			//		  if we are using quorum reads it shouldn't affecy unless majority of the
-			//		  pods are down simultaniously
+			// StatefulSets are only added to the hash ring when all replicas are ready.
+			// However, we don't immediately remove them when one or more pods crash,
+			// since the StatefulSet controller will typically reconcile and restore them.
+			//
+			// NOTE: During this interim period, write requests to the affected pod(s) may fail,
+			// leading to temporary unavailability for certain keys.
+			//
+			// If quorum-based reads are used, this shouldn't affect overall availability,
+			// unless a majority of the pods become unavailable at the same time.
 			if ss.Status.ReadyReplicas == *ss.Spec.Replicas {
 				log.Infof("All replicas are ready for StatefulSet: %s\n", ss.Name)
 				hashRing.Add(ss.Name)
@@ -140,6 +151,9 @@ func (t *Watcher) Run(hashRing *hash.OuterRing) {
 
 		case watch.Deleted:
 			log.Infof("[DELETED] StatefulSet: %s\n", ss.Name)
+
+			// On complete deletion of a StatefulSet, ensure it's removed from the hash ring.
+			// This prevents requests from being routed to pods that no longer exist.
 			hashRing.Remove(ss.Name)
 
 		case watch.Error:
