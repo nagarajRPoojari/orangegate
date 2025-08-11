@@ -175,14 +175,14 @@ func (t *Proxy) processQuery(q string) (any, error) {
 		shs := t.hashRing.GetAllShards()
 		for _, sh := range shs {
 			for i := range t.replicaCount {
-				go func(i int) {
-					log.Infof("calling create to: ", buildAddr(sh.Id, i, t.namespace))
-					cl := t.cache.Get(buildAddr(sh.Id, i, t.namespace))
-					// If connection is already lost, gRPC tries to reconnect with a timeout.
-					// @issue: if pod is down & cannot spin up within timeout it will fail to
-					// process create request leading to all further insert failures.
-					cl.Create(&v)
-				}(i)
+				log.Infof("calling create to: %s", buildAddr(sh.Id, i, t.namespace))
+				cl := t.cache.Get(buildAddr(sh.Id, i, t.namespace))
+				// If connection is already lost, gRPC tries to reconnect with a timeout.
+				// @issue: if pod is down & cannot spin up within timeout it will fail to
+				// process create request leading to all further insert failures.
+				if err := cl.Create(&v); err != nil {
+					log.Errorf("error while creating: %v ", err)
+				}
 			}
 		}
 		return nil, nil
