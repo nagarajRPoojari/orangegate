@@ -20,7 +20,9 @@ func NewCache() *Cache {
 // and then returns it.
 func (t *Cache) Get(addr string) *client.Client {
 	if _, ok := t.conns[addr]; !ok {
-		t.set(addr, client.NewClient(addr, 52001))
+		// NewClient tries to establish a connection with server
+		// and keeps retrying with exponential backfoff
+		t.set(addr, client.NewClient(addr, 52001, 10))
 	}
 	return t.conns[addr]
 }

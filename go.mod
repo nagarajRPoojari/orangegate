@@ -3,7 +3,7 @@ module github.com/nagarajRPoojari/orangectl
 go 1.24.5
 
 require (
-	github.com/nagarajRPoojari/orange v1.0.0
+	github.com/nagarajRPoojari/orange v1.0.1
 	k8s.io/api v0.33.3
 	k8s.io/apimachinery v0.33.3
 	k8s.io/client-go v0.33.3

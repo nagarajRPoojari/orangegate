@@ -64,41 +64,67 @@ func NewProxy(addr string) *Proxy {
 		replicaCount: replicaCount,
 		cache:        NewCache(),
 	}
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Acquire read lock for thread-safe access
 		mu.RLock()
 		defer mu.RUnlock()
 
 		var req Req
 
-		err := json.NewDecoder(r.Body).Decode(&req)
+		// Parse and validate the request body
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			log.Errorf("Failed to decode request body: %v", err)
+			http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+			return
+		}
 
+		// Process the query using the target logic
 		res, err := t.processQuery(req.Query)
-		log.Infof("recevied result, res=%v, err=%v, query: %v", res, err, req.Query)
 		if err != nil {
-			http.Error(w, "Proxy error: "+err.Error(), 502)
+			log.Errorf("Error processing query [%s]: %v", req.Query, err)
+			http.Error(w, "Failed to process query: "+err.Error(), http.StatusBadGateway)
 			return
 		}
 
+		log.Infof("Processed query successfully: %s", req.Query)
+
+		// Handle nil response gracefully
 		if res == nil {
-			res = "sucess"
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`"success"`))
 			return
 		}
 
+		// Ensure the response is in the expected []byte format
+		resBytes, ok := res.([]byte)
+		if !ok {
+			log.Errorf("Unexpected response type for query [%s]: %T", req.Query, res)
+			http.Error(w, "Internal server error", http.StatusInternalServerError)
+			return
+		}
+
+		// Attempt to unmarshal the response
 		var data interface{}
-		resBytes := res.([]byte)
 		if err := json.Unmarshal(resBytes, &data); err != nil {
-			http.Error(w, "Failed to unmarshal: "+err.Error(), 502)
+			log.Errorf("Failed to unmarshal response for query [%s]: %v", req.Query, err)
+			http.Error(w, "Failed to decode backend response", http.StatusBadGateway)
 			return
 		}
 
-		response, err := json.MarshalIndent(data, "", "  ")
+		// Marshal the result into pretty-printed JSON
+		formattedJSON, err := json.MarshalIndent(data, "", "  ")
 		if err != nil {
-			http.Error(w, "Failed to format: "+err.Error(), 502)
+			log.Errorf("Failed to format response for query [%s]: %v", req.Query, err)
+			http.Error(w, "Failed to format response", http.StatusInternalServerError)
 			return
 		}
 
+		// Return the formatted JSON response
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(response)
+		w.WriteHeader(http.StatusOK)
+		w.Write(formattedJSON)
 	})
 
 	return t
@@ -132,13 +158,18 @@ func (t *Proxy) processQuery(q string) (any, error) {
 
 	switch v := op.(type) {
 	case oql.CreateOp:
-		// create requests are broadcasted to all nodes of all shards
+		// create requests are broadcasted to all nodes of all shards.
+		// @todo: need complete ack from all nodes before acknowledging
+		// back to client
 		shs := t.hashRing.GetAllShards()
 		for _, sh := range shs {
 			for i := range t.replicaCount {
 				go func(i int) {
 					log.Infof("calling create to: ", buildAddr(sh.Id, i, t.namespace))
 					cl := t.cache.Get(buildAddr(sh.Id, i, t.namespace))
+					// If connection is already lost, gRPC tries to reconnect with a timeout.
+					// @issue: if pod is down & cannot spin up within timeout it will fail to
+					// process create request leading to all further insert failures.
 					cl.Create(&v)
 				}(i)
 			}
@@ -147,6 +178,7 @@ func (t *Proxy) processQuery(q string) (any, error) {
 
 	case oql.InsertOp:
 		var key int64
+		// OQL allows user to write _ID in any form that can be converted to int64
 		switch val := v.Value["_ID"].(type) {
 		case int64:
 			key = val
@@ -154,19 +186,24 @@ func (t *Proxy) processQuery(q string) (any, error) {
 			key = int64(val)
 		case float64:
 			key = int64(val)
+		// allowing json.Number for further support json types
 		case json.Number:
 			k, err := val.Int64()
-			if err == nil {
-				key = k
-			} else {
-				log.Fatalf("can't cast json val, %v", val)
+			if err != nil {
+				return nil, fmt.Errorf("can't cast json val, %v", val)
 			}
+			key = k
 		default:
-			log.Fatalf("can't cast, %v", val)
+			return nil, fmt.Errorf("can't cast, %v", val)
 		}
+
 		addr := t.hashRing.GetNode(fmt.Sprint(key))
 		log.Infof("calling insert to: %s", addr)
+
 		cl := t.cache.Get(addr)
+		// If connection is already lost, gRPC tries to reconnect with a timeout.
+		// @issue: if pod is down & cannot spin up within timeout it will fail to
+		// process create request leading to all further insert failures.
 		return nil, cl.Insert(&v)
 
 	case oql.SelectOp:
