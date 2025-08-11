@@ -56,8 +56,9 @@ func NewProxy(addr string) *Proxy {
 	namespcae := utils.GetEnv(__K8S_NAMESAPCE__, "", true)
 
 	t := &Proxy{
-		Addr:         addr,
-		wt:           *watch.NewWatcher(),
+		Addr: addr,
+		wt:   *watch.NewWatcher(),
+		// keeping 3 virtual nodes per shard to ensure uniform distribution
 		hashRing:     hash.NewHashRing(3, replicaCount, namespcae),
 		namespace:    namespcae,
 		replicaCount: replicaCount,
@@ -135,9 +136,11 @@ func (t *Proxy) processQuery(q string) (any, error) {
 		shs := t.hashRing.GetAllShards()
 		for _, sh := range shs {
 			for i := range t.replicaCount {
-				cl := t.cache.Get(buildAddr(sh.Id, i, t.namespace))
-				log.Infof("calling create to: ", buildAddr(sh.Id, i, t.namespace))
-				cl.Create(&v)
+				go func(i int) {
+					log.Infof("calling create to: ", buildAddr(sh.Id, i, t.namespace))
+					cl := t.cache.Get(buildAddr(sh.Id, i, t.namespace))
+					cl.Create(&v)
+				}(i)
 			}
 		}
 		return nil, nil
@@ -175,7 +178,6 @@ func (t *Proxy) processQuery(q string) (any, error) {
 			cl := t.cache.Get(buildAddr(sh.Id, i, t.namespace))
 			// offcourse this is not how quorum works
 			res, err = cl.Select(&v)
-			fmt.Println(res)
 		}
 		return res, err
 

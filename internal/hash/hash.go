@@ -122,7 +122,6 @@ func (t *OuterRing) add(shard string, id int) *Shard {
 // It first identifies the appropriate shard (OuterRingNode) using consistent hashing,
 // then selects the correct replica (InnerRingNode) within that shard's inner ring.
 // If the ring is uninitialized or incomplete, it returns an empty str
-
 func (t *OuterRing) GetNode(key string) string {
 	if t.Head == nil {
 		return ""
