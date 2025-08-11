@@ -16,6 +16,12 @@ import (
 const (
 	__K8S__REPLICA_COUNT__ = "__K8S__REPLICA_COUNT__"
 	__K8S_NAMESAPCE__      = "__K8S_NAMESAPCE__"
+	__ACK_LEVEL__          = "__ACK_LEVEL__"
+
+	// values
+	__QUORUM__ = "quorum"
+	__ALL__    = "all"
+	__SINGLE__ = "single"
 )
 
 var (
@@ -45,6 +51,9 @@ type Proxy struct {
 
 	// replicaCount defines the number of replicas per shard managed by this proxy.
 	replicaCount int
+
+	// ack level
+	ackLevel string
 }
 
 type Req struct {
@@ -63,6 +72,8 @@ func NewProxy(addr string) *Proxy {
 		namespace:    namespcae,
 		replicaCount: replicaCount,
 		cache:        NewCache(),
+		// by default setting ack level to quorum
+		ackLevel: utils.GetEnv(__ACK_LEVEL__, __QUORUM__),
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -209,14 +220,51 @@ func (t *Proxy) processQuery(q string) (any, error) {
 	case oql.SelectOp:
 		key := v.ID
 		sh := t.hashRing.GetShard(fmt.Sprint(key))
-		var res []byte
-		var err error
-		for i := range t.replicaCount {
-			cl := t.cache.Get(buildAddr(sh.Id, i, t.namespace))
-			// offcourse this is not how quorum works
-			res, err = cl.Select(&v)
+
+		var result any
+		var w int // Number of successful responses required (write quorum)
+
+		// Determine required acknowledgment level based on consistency config
+		switch t.ackLevel {
+		case __QUORUM__:
+			// majority of replicas
+			w = t.replicaCount/2 + 1
+		case __ALL__:
+			// all replicas must respond
+			w = t.replicaCount
+		case __SINGLE__:
+			// accept first successful response (eventual consistency)
+			w = 0
 		}
-		return res, err
+
+		var wg sync.WaitGroup
+		wg.Add(w)
+
+		// Launch concurrent requests to all replicas
+		for i := range t.replicaCount {
+			go func(replicaIndex int) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Errorf("Recovered from panic in replica %d: %v", replicaIndex, r)
+					}
+				}()
+
+				addr := buildAddr(sh.Id, replicaIndex, t.namespace)
+				cl := t.cache.Get(addr)
+
+				if res, err := cl.Select(&v); err == nil {
+					// Store first successful result
+					result = res
+					wg.Done()
+				} else {
+					log.Warnf("Select failed on replica %d: %v", replicaIndex, err)
+				}
+			}(i)
+		}
+
+		// wait until required number of replicas have responded successfully
+		wg.Wait()
+		return result, err
 
 	case oql.DeleteOp:
 		return nil, fmt.Errorf("delete op not implpemented")
